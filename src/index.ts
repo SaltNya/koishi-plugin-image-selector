@@ -25,6 +25,7 @@ export interface Config {
   sendCommandName: string
   saveFailFallback: boolean
   listCommandName: string
+  refreshCommandName: string
 
   userLimits: { userId: string; sizeLimit: number }[]
   groupLimits: { guildId: string; sizeLimit: number }[]
@@ -36,6 +37,7 @@ export const Config: Schema<Config> =
   Schema.intersect([
     Schema.object({
       listCommandName: Schema.string().default('图库列表').description('图库列表指令名称'),
+      refreshCommandName: Schema.string().default('刷新图库').description('刷新图库缓存指令名称'),
     }).description('图库列表'),
     Schema.object({
       sendCommandName: Schema.string().default('发图').description('发图指令名称'),
@@ -78,6 +80,28 @@ export function apply(ctx: Context, config: Config) {
     if (config.debugMode) {
       (ctx.logger.info as (...args: any[]) => void)(...args);
     }
+  }
+
+  // 文件夹缓存机制
+  let folderCache: { folders: any[], timestamp: number } | null = null
+  const CACHE_TTL = 5 * 60 * 1000 // 5分钟缓存
+
+  async function getFolders() {
+    const now = Date.now()
+    if (!folderCache || (now - folderCache.timestamp > CACHE_TTL)) {
+      loginfo('缓存已过期或不存在，重新读取文件夹列表')
+      const folders = await fs.readdir(config.imagePath, { withFileTypes: true })
+      folderCache = { folders, timestamp: now }
+      loginfo(`已缓存 ${folders.length} 个文件夹`)
+    } else {
+      loginfo('使用缓存的文件夹列表')
+    }
+    return folderCache.folders
+  }
+
+  function clearCache() {
+    folderCache = null
+    loginfo('文件夹缓存已清除')
   }
 
   const getFileExtension = (file: any, imgType: string) => {
@@ -294,7 +318,7 @@ export function apply(ctx: Context, config: Config) {
 
         // 尝试在图片库中匹配文件夹 (使用发图相同的逻辑)
         if (keyword) {
-          const imageFolders = await fs.readdir(config.imagePath, { withFileTypes: true })
+          const imageFolders = await getFolders()
           const matchedFolders = []
           for (const folder of imageFolders) {
             if (!folder.isDirectory()) continue
@@ -389,7 +413,7 @@ export function apply(ctx: Context, config: Config) {
     .usage('查看当前所有可用的图库关键词及别名列表。')
     .action(async ({ session }) => {
       try {
-        const folders = await fs.readdir(config.imagePath, { withFileTypes: true })
+        const folders = await getFolders()
         let messageLines = []
 
         // 收集并格式化文件夹信息
@@ -423,11 +447,25 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
+  // 刷新图库缓存指令
+  ctx.command(`${config.refreshCommandName}`)
+    .usage('手动刷新图库缓存，适用于添加或删除图片文件夹后立即生效。')
+    .action(async ({ session }) => {
+      try {
+        clearCache()
+        const folders = await getFolders()
+        const folderCount = folders.filter(f => f.isDirectory()).length
+        return `图库缓存已刷新，当前共有 ${folderCount} 个文件夹`
+      } catch (error) {
+        return `刷新失败: ${error.message}`
+      }
+    })
+
   async function processImageRequest(session: Session, input: string) {
     if (!input) return false
 
     try {
-      const folders = await fs.readdir(config.imagePath, { withFileTypes: true })
+      const folders = await getFolders()
 
       // 寻找所有可能的匹配（input以别名开头）
       const possibleMatches = []
