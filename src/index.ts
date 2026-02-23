@@ -37,39 +37,39 @@ export interface Config {
 export const Config: Schema<Config> =
   Schema.intersect([
     Schema.object({
-      listCommandName: Schema.string().default('图库列表').description('图库列表指令名称'),
-      refreshCommandName: Schema.string().default('刷新图库').description('刷新图库缓存指令名称'),
-    }).description('图库列表'),
+      listCommandName: Schema.string().default('图库列表').description('图库列表指令名（可自定义）'),
+      refreshCommandName: Schema.string().default('刷新图库').description('刷新图库缓存指令名（可自定义）'),
+    }).description('图库指令'),
     Schema.object({
-      sendCommandName: Schema.string().default('发图').description('发图指令名称'),
-      maxout: Schema.number().default(5).description('一次最大输出图片数量'),
-      exactMatch: Schema.boolean().default(false).description('关键词精确匹配模式：开启后仅允许「关键词」或「关键词 数字」触发，否则为前缀模糊匹配（默认关闭，向下兼容）'),
-      imagePath: Schema.string().required().description('图片库路径').role('textarea', { rows: [2, 4] }),
+      sendCommandName: Schema.string().default('发图').description('发图指令名（可自定义）'),
+      maxout: Schema.number().default(5).description('单次最大发图数量'),
+      exactMatch: Schema.boolean().default(false).description('精确匹配模式：开启后仅「关键词」或「关键词 数字」触发；关闭则以关键词开头即触发（默认关闭）'),
+      imagePath: Schema.string().required().description('图片库根目录路径').role('textarea', { rows: [2, 4] }),
     }).description('发图功能'),
     Schema.object({
-      saveCommandName: Schema.string().default('存图').description('存图指令名称'),
-      tempPath: Schema.string().required().description('临时存储路径').role('textarea', { rows: [2, 4] }),
+      saveCommandName: Schema.string().default('存图').description('存图指令名（可自定义）'),
+      tempPath: Schema.string().required().description('临时存储目录路径').role('textarea', { rows: [2, 4] }),
       filenameTemplate: Schema.string().role('textarea', { rows: [2, 4] })
-        .default("${date}-${time}-${index}-${guildId}-${userId}${ext}").description('文件名模板，支持变量: ${userId}, ${username}, ${timestamp}, ${date}, ${time}, ${index}, ${ext}, ${guildId}, ${channelId}'),
-      promptTimeout: Schema.number().default(30).description('等待用户发送图片的超时时间 (秒)'),
-      saveFailFallback: Schema.boolean().default(true).description('匹配关键词失败时是否保存到临时目录（关闭则直接取消保存）'),
+        .default("${date}-${time}-${index}-${guildId}-${userId}${ext}").description('存图文件名模板，可用变量：${userId} ${username} ${timestamp} ${date} ${time} ${index} ${ext} ${guildId} ${channelId}'),
+      promptTimeout: Schema.number().default(30).description('交互式存图的等待超时（秒）'),
+      saveFailFallback: Schema.boolean().default(true).description('关键词匹配失败时：开启则存入临时目录，关闭则直接取消'),
     }).description('存图功能'),
     Schema.object({
       userLimits: Schema.array(Schema.object({
-        userId: Schema.string().required().description('用户ID'),
-        sizeLimit: Schema.number().min(0).step(0.1).required().description('上传尺寸限制(MB)'),
+        userId: Schema.string().required().description('用户 ID（填 default 作为全局默认）'),
+        sizeLimit: Schema.number().min(0).step(0.1).required().description('上传上限（MB），0 表示禁止上传'),
       })).role('table')
-        .description('用户上传限制列表 (MB)。必须包含 userId 为 "default" 的项作为默认限制。设置为 0 或非法值代表禁止上传。')
+        .description('用户上传限制。必须包含 userId 为 default 的行作为全局默认值，0 表示禁止上传。')
         .default([{ userId: 'default', sizeLimit: 0 }]),
       groupLimits: Schema.array(Schema.object({
-        guildId: Schema.string().required().description('群组ID'),
-        sizeLimit: Schema.number().min(0).step(0.1).required().description('上传尺寸限制(MB)'),
+        guildId: Schema.string().required().description('群组 ID（填 default 作为群组默认）'),
+        sizeLimit: Schema.number().min(0).step(0.1).required().description('上传上限（MB），0 表示禁止上传'),
       })).role('table')
-        .description('群组上传限制列表 (MB)。可包含 guildId 为 "default" 的项作为默认限制。')
+        .description('群组上传限制。可包含 guildId 为 default 的行作为群组默认值，0 表示禁止上传。')
         .default([{ guildId: 'default', sizeLimit: 0 }]),
     }).description('权限设置'),
     Schema.object({
-      debugMode: Schema.boolean().default(false).description('启用调试日志模式').experimental(),
+      debugMode: Schema.boolean().default(false).description('启用调试日志').experimental(),
     }).description('调试模式'),
 
   ]);
