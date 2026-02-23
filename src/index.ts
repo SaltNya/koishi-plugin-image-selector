@@ -26,7 +26,7 @@ export interface Config {
     saveFailFallback: boolean
     listCommandName: string
     refreshCommandName: string
-    exactMatch: boolean
+    matchMode: 'fuzzy' | 'exact' | 'none'
 
     userLimits: { userId: string; sizeLimit: number }[]
     groupLimits: { guildId: string; sizeLimit: number }[]
@@ -43,7 +43,11 @@ export const Config: Schema<Config> =
         Schema.object({
             sendCommandName: Schema.string().default('发图').description('发图指令名（可自定义）'),
             maxout: Schema.number().default(5).description('单次最大发图数量'),
-            exactMatch: Schema.boolean().default(false).description('精确匹配模式：开启后仅「关键词」或「关键词 数字」触发；关闭则以关键词开头即触发（默认关闭）'),
+            matchMode: Schema.union([
+                Schema.const('fuzzy' as const).description('模糊匹配：消息以关键词开头即触发'),
+                Schema.const('exact' as const).description('精确匹配：仅「关键词」或「关键词 数字」触发'),
+                Schema.const('none' as const).description('禁用中间件：关键词不直接触发，仅限指令触发'),
+            ]).default('fuzzy').description('关键词匹配模式'),
             imagePath: Schema.string().required().description('图片库根目录路径').role('textarea', { rows: [2, 4] }),
         }).description('发图功能'),
         Schema.object({
@@ -468,7 +472,7 @@ export function apply(ctx: Context, config: Config) {
 
         try {
             const folders = await getFolders()
-            const useExactMatch = config.exactMatch ?? false
+            const useExactMatch = config.matchMode === 'exact'
 
             // 寻找所有可能的匹配
             const possibleMatches = []
@@ -583,8 +587,10 @@ export function apply(ctx: Context, config: Config) {
     // 发图指令
     ctx.command(`${config.sendCommandName} <keyword:text>`)
         .usage(`用法：${config.sendCommandName} <关键词> [数量]
-模糊模式（默认）：关键词开头即触发，后缀非数字时发 1 张
-精确模式：仅「关键词」或「关键词 数字」触发，其余忽略
+匹配模式（可在配置修改）：
+- 模糊：关键词开头即触发，后缀非数字时发 1 张
+- 精确：仅「关键词」或「关键词 数字」触发，其余忽略
+- 禁用：仅限指令触发，关键词不再作为消息直接触发
 
 使用 ${config.listCommandName} 查看所有可用关键词。`)
         .action(async ({ session }, keyword) => {
@@ -605,7 +611,7 @@ export function apply(ctx: Context, config: Config) {
     // 发图中间件
     ctx.middleware(async (session, next) => {
         const input = session.stripped.content.trim()
-        if (!input) return next()
+        if (!input || config.matchMode === 'none') return next()
 
         // loginfo('收到消息:', { ... })
 
