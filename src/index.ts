@@ -26,6 +26,7 @@ export interface Config {
   saveFailFallback: boolean
   listCommandName: string
   refreshCommandName: string
+  exactMatch: boolean
 
   userLimits: { userId: string; sizeLimit: number }[]
   groupLimits: { guildId: string; sizeLimit: number }[]
@@ -42,6 +43,7 @@ export const Config: Schema<Config> =
     Schema.object({
       sendCommandName: Schema.string().default('发图').description('发图指令名称'),
       maxout: Schema.number().default(5).description('一次最大输出图片数量'),
+      exactMatch: Schema.boolean().default(false).description('关键词精确匹配模式：开启后仅允许「关键词」或「关键词 数字」触发，否则为前缀模糊匹配（默认关闭，向下兼容）'),
       imagePath: Schema.string().required().description('图片库路径').role('textarea', { rows: [2, 4] }),
     }).description('发图功能'),
     Schema.object({
@@ -466,8 +468,9 @@ export function apply(ctx: Context, config: Config) {
 
     try {
       const folders = await getFolders()
+      const useExactMatch = config.exactMatch ?? false
 
-      // 寻找所有可能的匹配（input以别名开头）
+      // 寻找所有可能的匹配
       const possibleMatches = []
 
       for (const folder of folders) {
@@ -477,14 +480,22 @@ export function apply(ctx: Context, config: Config) {
         const aliases = folderName.split('-')
 
         for (const alias of aliases) {
-          if (input.startsWith(alias)) {
-            const suffix = input.slice(alias.length).trim()
-            possibleMatches.push({
-              folderName,
-              alias,
-              suffix,
-              aliasLength: alias.length
-            })
+          if (useExactMatch) {
+            // 精确匹配：仅允许「关键词」或「关键词 数字」
+            if (input === alias) {
+              possibleMatches.push({ folderName, alias, suffix: '', aliasLength: alias.length })
+            } else if (input.startsWith(alias + ' ')) {
+              const suffix = input.slice(alias.length + 1).trim()
+              if (/^\d*$/.test(suffix)) {
+                possibleMatches.push({ folderName, alias, suffix, aliasLength: alias.length })
+              }
+            }
+          } else {
+            // 模糊匹配（默认）：input 以 alias 开头即触发
+            if (input.startsWith(alias)) {
+              const suffix = input.slice(alias.length).trim()
+              possibleMatches.push({ folderName, alias, suffix, aliasLength: alias.length })
+            }
           }
         }
       }
@@ -571,7 +582,7 @@ export function apply(ctx: Context, config: Config) {
 
   // 发图指令
   ctx.command(`${config.sendCommandName} <keyword:text>`)
-    .usage(`发送图片。使用 "${config.listCommandName}" 查看所有关键词\n用法：${config.sendCommandName} <关键词> [数量]\n示例：${config.sendCommandName} 猫图 5`)
+    .usage(`发送图片。使用 "${config.listCommandName}" 查看所有关键词\n用法：${config.sendCommandName} <关键词> [数量]\n示例：${config.sendCommandName} 猫图 5\n\n触发方式（可在插件配置中切换）：\n- 模糊匹配（默认）：消息以关键词开头即触发，suffix 非数字时默认发 1 张\n- 精确匹配：仅「关键词」或「关键词 数字」格式触发，其余一律忽略`)
     .action(async ({ session }, keyword) => {
       if (!keyword) {
         await session.execute(`${config.sendCommandName} -h`)
