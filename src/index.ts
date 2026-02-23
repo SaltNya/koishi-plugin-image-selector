@@ -9,11 +9,15 @@ export const inject = {
 };
 
 export const usage = `
----
+一个图片库管理插件。将图片按文件夹分类存放，发送关键词即可随机发图。
 
-<a target="_blank" href="https://www.npmjs.com/package/@deepseaxx/koishi-plugin-image-selector">➤ 食用方法点此获取</a>
+### 常用指令
+- **关键词 [数量]**：直接发送关键词发图
+- **存图 [关键词]**：保存图片或视频到指定分类
+- **图库列表**：查看所有可用关键词及别名
+- **刷新图库**：新增文件夹后手动刷新缓存
 
----
+<a target="_blank" href="https://www.npmjs.com/package/@deepseaxx/koishi-plugin-image-selector">➤ 详细配置及进阶用法文档</a>
 `;
 
 export interface Config {
