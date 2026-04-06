@@ -148,9 +148,9 @@ default: 0          → 默认所有人禁止上传
 **配置示例**
 ```
 groupMappings:
-  - groupName: group_a
+  - groupName: group_0
     guildIds: ['123456789', '987654321']
-  - groupName: group_b
+  - groupName: group_1
     guildIds: ['111111111']
 fallbackGroupName: default
 enableForUnmappedGroups: false
