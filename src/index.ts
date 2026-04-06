@@ -58,6 +58,9 @@ export interface Config {
 
     // 别名管理功能
     addAliasCommandName: string
+
+    // 猫娘化开关
+    nekoMode: boolean
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -124,13 +127,18 @@ export const Config: Schema<Config> = Schema.intersect([
 
     //文件夹创建功能
     Schema.object({
-    createCommandName: Schema.string().default('添加关键词').description('添加关键词文件夹指令名（可自定义）')
+        createCommandName: Schema.string().default('添加关键词').description('添加关键词文件夹指令名（可自定义）')
     }).description('文件夹创建功能'),
 
     // 别名管理功能
     Schema.object({
-    addAliasCommandName: Schema.string().default('添加别名').description('添加别名指令名（可自定义）')
-    }).description('别名管理功能')
+        addAliasCommandName: Schema.string().default('添加别名').description('添加别名指令名（可自定义）')
+    }).description('别名管理功能'),
+
+    // 猫娘化开关
+    Schema.object({
+        nekoMode: Schema.boolean().default(false).description('猫娘化回复：开启时回复带"喵~"等可爱语气，关闭时回复书面化语言')
+    }).description('回复风格设置')
 ])
 
 export function apply(ctx: Context, config: Config) {
@@ -162,6 +170,10 @@ export function apply(ctx: Context, config: Config) {
             return true
         }
         return enableForUnmappedGroups
+    }
+
+    function formatMessage(nekoText: string, normalText: string): string {
+        return config.nekoMode ? nekoText : normalText
     }
 
     function loginfo(...args: any[]) {
@@ -306,7 +318,10 @@ export function apply(ctx: Context, config: Config) {
         .action(async ({ session }, keyword?: string, ...图片: string[]) => {
             //群聊开关插件功能
             if (!isGroupEnabled(session)) {
-                return '该功能未在此群开启，去联系Bot管理员看看吧~'
+                return formatMessage(
+                    '该功能未在此群开启，去联系Bot管理员看看吧~',
+                    '该功能未在此群开启，可联系Bot管理员开启。'
+                )
             }
 
             const groupName = getGroupName(session.guildId)
@@ -342,10 +357,10 @@ export function apply(ctx: Context, config: Config) {
 
             // 如果没有图片(参数或引用)，尝试交互式获取
             if (allImages.length === 0) {
-                await session.send('请发送图片喵~')
+                await session.send(formatMessage('请发送图片喵~', '请发送图片。'))
                 const promptResult = await session.prompt(config.promptTimeout * 1000)
                 if (!promptResult) {
-                    return '未收到图片喵...'
+                    return formatMessage('未收到图片喵...', '未收到图片，操作已取消。')
                 }
                 const elements = h.parse(promptResult)
                 const images = elements.filter(el => ['img', 'mface', 'image', 'video'].includes(el.type))
@@ -353,15 +368,18 @@ export function apply(ctx: Context, config: Config) {
             }
 
             if (allImages.length === 0) {
-                return '未收到有效的图片喵...'
+                return formatMessage('未收到有效的图片喵...', '未收到有效的图片，操作已取消。')
             }
 
             // 检查是否已有分类（关键词），如果没有则询问
             if (!keyword) {
-                await session.send('请回复要保存的关键词（等待30秒超时）')
+                await session.send(formatMessage(
+                    '请回复要保存的关键词（等待30秒超时）',
+                    '请回复要保存的关键词（等待30秒超时）'
+                ))
                 const reply = await session.prompt(30 * 1000)
                 if (!reply) {
-                    return '等待超时，未执行保存'
+                    return formatMessage('等待超时，未执行保存喵~', '等待超时，未执行保存操作。')
                 }
                 keyword = reply.trim()
             }
@@ -426,7 +444,10 @@ export function apply(ctx: Context, config: Config) {
 
             const sizeLimitMB = limit
             if (sizeLimitMB <= 0) {
-                return '当前用户无上传权限或已被禁止上传'
+                return formatMessage(
+                    '当前用户无上传权限或已被禁止上传喵！',
+                    '当前用户无上传权限或已被禁止上传。'
+                )
             }
             loginfo(`用户 ${userId} 上传限制: ${sizeLimitMB}MB`)
             const sizeLimitBytes = sizeLimitMB * 1024 * 1024
@@ -456,7 +477,10 @@ export function apply(ctx: Context, config: Config) {
                         loginfo('匹配到文件夹')
                     } else {
                         if (!config.saveFailFallback) {
-                            return `没有找到关键词呢...`
+                            return formatMessage(
+                                `没有找到关键词呢...`,
+                                `未找到关键词“${keyword}”，保存失败。`
+                            )
                         }
                         loginfo(`没有找到关键词呢...`)
                     }
@@ -484,7 +508,10 @@ export function apply(ctx: Context, config: Config) {
                     if (buffer.length > sizeLimitBytes) {
                         const sizeMB = (buffer.length / (1024 * 1024)).toFixed(2)
                         loginfo(`文件大小超出限制: ${sizeMB}MB > ${sizeLimitMB}MB`)
-                        await session.send(`文件 ${i + 1} 大小(${sizeMB}MB)超出限制(${sizeLimitMB}MB)，已跳过`)
+                        await session.send(formatMessage(
+                            `文件 ${i + 1} 大小(${sizeMB}MB)超出限制(${sizeLimitMB}MB)，已跳过喵~`,
+                            `文件 ${i + 1} 大小(${sizeMB}MB)超出限制(${sizeLimitMB}MB)，已跳过。`
+                        ))
                         continue
                     }
 
@@ -518,39 +545,45 @@ export function apply(ctx: Context, config: Config) {
                 }
 
                 if (matched) {
-                    return `保存成功了喵~`
+                    return formatMessage('保存成功了喵~', '保存成功！')
                 } else {
-                    return `保存失败了喵...是不是名字写错了呢~`
+                    return formatMessage('保存失败了喵...是不是名字写错了呢~', '保存失败，可能是关键词不存在。')
                 }
             } catch (error) {
-                return `保存失败: ${error.message}`
+                return formatMessage(`保存失败: ${error.message}`, `保存失败: ${error.message}`)
             }
 
         })
 
-    //添加别名指令
+     //添加别名指令
     ctx.command(`${config.addAliasCommandName} <keyword> <alias>`)
         .userFields(['id', 'authority'])
         .action(async ({ session }, keyword: string, alias: string) => {
             //群聊开关插件功能
             if (!isGroupEnabled(session)) {
-                return '该功能未在此群开启，去联系Bot管理员看看吧~'
+                return formatMessage(
+                    '该功能未在此群开启，去联系Bot管理员看看吧~',
+                    '该功能未在此群开启，可联系Bot管理员开启。'
+                )
             }
             const groupName = getGroupName(session.guildId)
 
             if (!keyword || !alias) {
-                return '请指定关键词和别名。'
+                return formatMessage('请指定关键词和别名喵...', '请指定关键词和别名。')
             }
 
             const sanitize = (s: string) => s.replace(/[\\/:*?"<>|]/g, '_')
             const sanitizedAlias = sanitize(alias)
             if (sanitizedAlias.length === 0) {
-                return '别名包含非法字符，无法使用。'
+                return formatMessage('别名包含非法字符喵！', '别名包含非法字符，无法使用。')
             }
 
             const folderInfo = await findFolder(keyword, groupName)
             if (!folderInfo) {
-                return `未找到关键词 "${keyword}" 对应的文件夹。`
+                return formatMessage(
+                    `未找到关键词 "${keyword}" 对应的文件夹呢...`,
+                    `未找到关键词 "${keyword}" 对应的文件夹。`
+                )
             }
 
             const { rootPath, folderName } = folderInfo
@@ -559,7 +592,10 @@ export function apply(ctx: Context, config: Config) {
             const existingAliases = currentParts.slice(1)
 
             if (existingAliases.includes(sanitizedAlias) || sanitizedAlias === mainKeyword) {
-                return `别名 "${alias}" 已存在，请勿重复添加。`
+                return formatMessage(
+                    `别名 "${alias}" 已存在，不要重复添加喵！`,
+                    `别名 "${alias}" 已存在，请勿重复添加。`
+                )
             }
 
             const newFolderName = folderName + '-' + sanitizedAlias
@@ -568,7 +604,10 @@ export function apply(ctx: Context, config: Config) {
 
             try {
                 await fs.access(newPath)
-                return `目标文件夹 "${newFolderName}" 已存在，无法重命名。`
+                return formatMessage(
+                    `目标文件夹 "${newFolderName}" 已存在，无法重命名呢...`,
+                    `目标文件夹 "${newFolderName}" 已存在，无法重命名。`
+                )
             } catch {
                 // 不存在，继续
             }
@@ -576,10 +615,13 @@ export function apply(ctx: Context, config: Config) {
             try {
                 await fs.rename(oldPath, newPath)
                 clearCache(groupName)
-                return `别名 "${alias}" 添加成功，当前文件夹名称为 "${newFolderName}"。`
+                return formatMessage(
+                    `别名 "${alias}" 添加成功喵，当前文件夹名称为 "${newFolderName}"喵~`,
+                    `别名 "${alias}" 添加成功，当前文件夹名称为 "${newFolderName}"。`
+                )
             } catch (error: any) {
                 ctx.logger.error('添加别名失败', error)
-                return `添加别名失败: ${error.message}`
+                return formatMessage(`添加别名失败: ${error.message}`, `添加别名失败: ${error.message}`)
             }
         })
 
@@ -589,12 +631,15 @@ export function apply(ctx: Context, config: Config) {
         .action(async ({ session }, keyword: string, ...aliases: string[]) => {
             //群聊开关插件功能
             if (!isGroupEnabled(session)) {
-                return '该功能未在此群开启，去联系Bot管理员看看吧~'
+                return formatMessage(
+                    '该功能未在此群开启，去联系Bot管理员看看吧~',
+                    '该功能未在此群开启，可联系Bot管理员开启。'
+                )
             }
             const groupName = getGroupName(session.guildId)
 
             if (!keyword) {
-                return '请指定关键词喵~'
+                return formatMessage('请指定关键词喵~', '请指定关键词。')
             }
 
             const sanitize = (s: string) => s.replace(/[\\/:*?"<>|]/g, '_')
@@ -602,7 +647,7 @@ export function apply(ctx: Context, config: Config) {
             const aliasParts = aliases.map(a => sanitize(a)).filter(a => a.length > 0)
 
             if (mainPart.length === 0) {
-                return '关键词无效（过滤后为空）。'
+                return formatMessage('关键词无效（过滤后为空）。', '关键词无效（过滤后为空）。')
             }
 
             const folderName = [mainPart, ...aliasParts].join('-')
@@ -691,8 +736,11 @@ export function apply(ctx: Context, config: Config) {
     ctx.command(`${config.listCommandName}`)
         .action(async ({ session }) => {
             //群聊开关插件功能
-            if (!isGroupEnabled(session)) {
-                return '该功能未在此群开启，去联系Bot管理员看看吧~'
+             if (!isGroupEnabled(session)) {
+            return formatMessage(
+                '该功能未在此群开启，去联系Bot管理员看看吧~',
+                '该功能未在此群开启，可联系Bot管理员开启。'
+                )
             }
             const groupName = getGroupName(session.guildId)
 
@@ -724,7 +772,7 @@ export function apply(ctx: Context, config: Config) {
                         line = `${mainName}   `
                     }
                     if (mediaCount === 0) {
-                        line += '还没有图片呢...'
+                        line += formatMessage('还没有图片呢...', '暂无图片。')
                     } else {
                         line += `有${mediaCount}张图片`
                     }
@@ -732,7 +780,7 @@ export function apply(ctx: Context, config: Config) {
                 }
 
                 if (!hasFolders) {
-                    return '图库为空呢...'
+                    return formatMessage('图库为空呢...', '图库为空。')
                 }
 
                 const header = `发送指令或别名随机返回图片，也可使用“${config.sendCommandName} 关键词 数量”`
@@ -751,16 +799,22 @@ export function apply(ctx: Context, config: Config) {
         .action(async ({ session }) => {
             //还是群聊开关插件功能
             if (!isGroupEnabled(session)) {
-                return '该功能未在此群开启，去联系Bot管理员看看吧~'
+                return formatMessage(
+                    '该功能未在此群开启，去联系Bot管理员看看吧~',
+                    '该功能未在此群开启，请联系Bot管理员。'
+                )
             }
             const groupName = getGroupName(session.guildId)
             try {
                 clearCache(groupName)
                 const folders = await getFolders(groupName)
                 const folderCount = folders.filter(f => f.isDirectory()).length
-                return `图库缓存已刷新，当前共有 ${folderCount} 个文件夹`
+                return formatMessage(
+                    `图库缓存已刷新，当前共有 ${folderCount} 个文件夹`,
+                    `图库缓存已刷新，当前共有 ${folderCount} 个文件夹。`
+                )
             } catch (error: any) {
-                return `刷新失败: ${error.message}`
+                return formatMessage(`刷新失败: ${error.message}`, `刷新失败: ${error.message}`)
             }
         })
 
@@ -769,7 +823,10 @@ export function apply(ctx: Context, config: Config) {
         //依旧是群聊开关插件功能
         if (!isGroupEnabled(session)) {
             if (sendPrompt) {
-                await session.send('该功能未在此群开启，去联系Bot管理员看看吧~')
+                await session.send(formatMessage(
+                    '该功能未在此群开启，去联系Bot管理员看看吧~',
+                    '该功能未在此群开启，请联系Bot管理员。'
+                ))
             }
             return false
         }
@@ -896,7 +953,7 @@ export function apply(ctx: Context, config: Config) {
             let keyword = input.slice(cmdName.length).trim()
 
             if (!keyword) {
-                await session.send(`请指定关键词喵...”`)
+                await session.send(formatMessage(`请指定关键词喵...`, `请指定关键词。`))
                 return
             }
             const groupName = getGroupName(session.guildId)
