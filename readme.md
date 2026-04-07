@@ -74,7 +74,7 @@
 ```
 
 **配置项：**
-- 'basePath'（必填）：图片库根目录路径
+- `basePath`（必填）：图片库根目录路径
 - `saveFailFallback`（默认 `true`）：关键词匹配失败时的行为，`true` 存入临时目录，`false` 直接取消
 - `promptTimeout`（默认 `30`）：交互式存图的等待超时，单位秒
 - `filenameTemplate`：存图文件名模板，详见"文件名模板"
