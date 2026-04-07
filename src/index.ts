@@ -61,6 +61,7 @@ export interface Config {
 
     // 聊天记录删除功能
     enableRecordDelete: boolean
+    enableRecordSubmit: boolean
 
     // 猫娘化开关
     nekoMode: boolean
@@ -140,7 +141,8 @@ export const Config: Schema<Config> = Schema.intersect([
 
     // 聊天记录删除功能
     Schema.object({
-        enableRecordDelete: Schema.boolean().default(true).description('启用被保存者删除记录功能')
+        enableRecordDelete: Schema.boolean().default(true).description('启用被保存者删除记录功能'),
+        enableRecordSubmit: Schema.boolean().default(false).description('启用新增记录（关闭时仅可删除已有记录）')
     }).description('聊天记录删除功能'),
 
     // 猫娘化开关
@@ -160,6 +162,124 @@ export function apply(ctx: Context, config: Config) {
             for (const guildId of mapping.guildIds) {
                 guildToGroup.set(guildId, mapping.groupName)
             }
+        }
+    }
+
+    // 群组发现函数：从磁盘自动扫描已有的群组文件夹
+    async function discoverGroupsFromDisk(): Promise<string[]> {
+        try {
+            const items = await fs.readdir(basePath, { withFileTypes: true })
+            const groups: string[] = []
+            
+            for (const item of items) {
+                if (!item.isDirectory()) continue
+                
+                const groupName = item.name
+                // 检查该目录是否包含 images 文件夹（标志是一个有效的群组）
+                try {
+                    const imagesPath = join(basePath, groupName, 'images')
+                    await fs.access(imagesPath)
+                    groups.push(groupName)
+                    loginfo(`发现群组文件夹: ${groupName}`)
+                } catch {
+                    // 目录不是有效的群组
+                }
+            }
+            
+            return groups
+        } catch (error) {
+            loginfo(`扫描群组文件夹失败: ${error}`)
+            return []
+        }
+    }
+
+    // 生成群组发现报告
+    async function generateGroupDiscoveryReport(): Promise<void> {
+        try {
+            const discoveredGroups = await discoverGroupsFromDisk()
+            const configuredGroups = groupMappings.map(m => m.groupName)
+            
+            loginfo(`=== 群组发现报告 ===`)
+            loginfo(`配置的群组: ${configuredGroups.join(', ') || '(无)'}`)
+            loginfo(`磁盘中发现的群组: ${discoveredGroups.join(', ') || '(无)'}`)
+            
+            // 查找未配置的群组
+            const unconfiguredGroups = discoveredGroups.filter(g => !configuredGroups.includes(g))
+            if (unconfiguredGroups.length > 0) {
+                loginfo(`⚠️  未配置的群组: ${unconfiguredGroups.join(', ')}`)
+                loginfo(`    💡 建议在 groupMappings 中添加这些群组的 guildIds 映射`)
+            }
+            
+            // 查找不存在的群组
+            const nonexistentGroups = configuredGroups.filter(g => !discoveredGroups.includes(g))
+            if (nonexistentGroups.length > 0) {
+                loginfo(`⚠️  配置中不存在的群组文件夹: ${nonexistentGroups.join(', ')}`)
+                loginfo(`    💡 请检查磁盘路径或删除不再使用的配置`)
+            }
+            
+            if (unconfiguredGroups.length === 0 && nonexistentGroups.length === 0) {
+                loginfo(`✨ 所有群组配置都是正确的！`)
+            }
+        } catch (error) {
+            loginfo(`❌ 生成群组发现报告失败: ${error}`)
+        }
+    }
+
+    // 生成建议的群组映射配置
+    async function generateGroupMappingConfig(): Promise<string> {
+        try {
+            const discoveredGroups = await discoverGroupsFromDisk()
+            if (discoveredGroups.length === 0) {
+                return '// 未发现任何群组文件夹'
+            }
+
+            let configContent = `// 根据磁盘发现的群组自动生成的映射配置\n`
+            configContent += `// 编辑此配置并将其添加到插件配置的 groupMappings 中\n`
+            configContent += `// 格式: 为每个群组添加对应的 QQ 群 ID (guildIds)\n\n`
+            configContent += `groupMappings = [\n`
+
+            for (const group of discoveredGroups) {
+                const isConfigured = groupMappings.some(m => m.groupName === group)
+                const status = isConfigured ? '' : ' // ⚠️  未配置'
+                configContent += `  {\n`
+                configContent += `    groupName: '${group}',\n`
+                configContent += `    guildIds: [] // 添加要映射到此群组的 QQ 群 ID${status}\n`
+                configContent += `  },\n`
+            }
+
+            configContent += `]\n`
+            return configContent
+        } catch (error) {
+            loginfo(`❌ 生成群组映射配置失败: ${error}`)
+            return '// 生成失败'
+        }
+    }
+
+    // 自动迁移所有发现的群组
+    async function autoMigrateAllGroups(): Promise<void> {
+        try {
+            const discoveredGroups = await discoverGroupsFromDisk()
+            
+            if (discoveredGroups.length === 0) {
+                loginfo(`📭 未发现任何需要迁移的群组`)
+                return
+            }
+            
+            loginfo(`========== 开始自动群组迁移 ==========`)
+            loginfo(`🔄 发现 ${discoveredGroups.length} 个群组，准备迁移旧数据...`)
+            
+            for (const groupName of discoveredGroups) {
+                try {
+                    await migrateOldRecords(groupName)
+                } catch (error) {
+                    loginfo(`⚠️  群组 '${groupName}' 迁移过程中出现错误: ${error}`)
+                }
+            }
+            
+            loginfo(`✅ 所有群组迁移完成`)
+            loginfo(`=====================================`)
+        } catch (error) {
+            loginfo(`❌ 自动迁移失败: ${error}`)
         }
     }
 
@@ -288,6 +408,125 @@ export function apply(ctx: Context, config: Config) {
         }
         return null
     }
+
+    // 数据迁移函数：从已有图片文件夹和JSON配置生成初始 records-config.json
+    // 同时将旧的文件夹名格式（keyword-alias1-alias2）转换为JSON配置格式
+    async function migrateOldRecords(groupName: string): Promise<void> {
+        const configPath = getRecordsConfigPath(groupName)
+        const aliasConfigPath = getAliasConfigPath(groupName)
+        
+        try {
+            // 检查配置文件是否已存在
+            await fs.access(configPath)
+            loginfo(`records-config.json 已存在，跳过迁移 for group ${groupName}`)
+            return
+        } catch {
+            // 文件不存在，需要迁移
+        }
+
+        try {
+            loginfo(`开始迁移旧数据 for group ${groupName}`)
+            const imagePath = getImagePath(groupName)
+            const recordsConfig: RecordConfig[] = []
+
+            // 首先检查 alias-config.json 是否存在
+            let aliasConfig: AliasConfig[] = []
+            try {
+                const aliasData = await fs.readFile(aliasConfigPath, 'utf-8')
+                aliasConfig = JSON.parse(aliasData)
+                loginfo(`成功读取现有别名配置，包含 ${aliasConfig.length} 个关键词`)
+            } catch (err) {
+                loginfo(`别名配置文件不存在或读取失败，将从文件夹扫描生成`)
+            }
+
+            // 如果没有 alias-config.json，从实际文件夹结构生成配置
+            if (aliasConfig.length === 0) {
+                try {
+                    const folder = await fs.readdir(imagePath, { withFileTypes: true })
+                    const folders = folder.filter(f => f.isDirectory()).map(f => f.name)
+
+                    for (const folderName of folders) {
+                        // 解析旧格式文件夹名: keyword-alias1-alias2...
+                        const parts = folderName.split('-')
+                        const keyword = parts[0]
+                        const aliases = parts.slice(1)
+
+                        // 检查是否已有该关键词
+                        let existingKeyword = aliasConfig.find(item => item.keyword === keyword)
+                        if (!existingKeyword) {
+                            existingKeyword = {
+                                keyword: keyword,
+                                aliases: []
+                            }
+                            aliasConfig.push(existingKeyword)
+                        }
+
+                        // 合并别名
+                        for (const alias of aliases) {
+                            if (!existingKeyword.aliases.includes(alias)) {
+                                existingKeyword.aliases.push(alias)
+                            }
+                        }
+
+                        loginfo(`从文件夹解析: ${folderName} => 关键词: ${keyword}, 别名: ${aliases.join(', ')}`)
+                    }
+
+                    // 保存生成的别名配置
+                    if (aliasConfig.length > 0) {
+                        await saveAliasConfig(groupName, aliasConfig)
+                        loginfo(`生成别名配置成功，包含 ${aliasConfig.length} 个关键词`)
+                    }
+                } catch (err: any) {
+                    loginfo(`从文件夹扫描生成别名配置失败: ${err.message}`)
+                }
+            }
+
+            // 为所有关键词生成迁移记录
+            for (const item of aliasConfig) {
+                const keywordPath = join(imagePath, item.keyword)
+                try {
+                    const files = await fs.readdir(keywordPath)
+                    const mediaFiles = files.filter(file =>
+                        /\.(jpe?g|png|gif|webp|mp4|mov|avi|bmp|tiff?)$/i.test(file)
+                    )
+
+                    if (mediaFiles.length === 0) continue
+
+                    // 为这个关键词创建一条通用迁移记录
+                    const migrationRecord: RecordConfig = {
+                        groupId: 'migrated',
+                        recordedUserId: 'unknown', // 标记为来自旧版本
+                        recordedUserName: '旧版数据',
+                        keyword: item.keyword,
+                        files: mediaFiles.map(file => ({
+                            filename: file,
+                            uploadTime: 0 // 无法获知上传时间
+                        }))
+                    }
+                    recordsConfig.push(migrationRecord)
+                    loginfo(`迁移了 ${mediaFiles.length} 个文件到关键词 "${item.keyword}"`)
+                } catch (err: any) {
+                    if (config.debugMode) {
+                        loginfo(`扫描关键词文件夹失败: ${item.keyword}`, err.message)
+                    }
+                }
+            }
+
+            // 保存迁移后的数据
+            if (recordsConfig.length > 0) {
+                await saveRecordsConfig(groupName, recordsConfig)
+                loginfo(`数据迁移完成，生成了 ${recordsConfig.length} 条记录 for group ${groupName}`)
+            } else {
+                // 即使没有数据，也创建空配置文件以标记已迁移
+                await saveRecordsConfig(groupName, [])
+                loginfo(`未找到可迁移的数据 for group ${groupName}`)
+            }
+        } catch (err: any) {
+            ctx.logger.warn(`数据迁移失败，将继续运行: ${err.message}`)
+            // 不中断插件启动
+        }
+    }
+
     const folderCacheMap = new Map<string, { folders: Dirent[]; timestamp: number }>()
     const CACHE_TTL = 5 * 60 * 1000 // 5分钟缓存
 
@@ -614,8 +853,8 @@ export function apply(ctx: Context, config: Config) {
                 if (matched) {
                     const mediaCount = await countMediaFilesInFolder(targetPath)
                     
-                    // 记录被保存人信息
-                    if (savedCount > 0) {
+                    // 仅在启用 Record Submit 时记录被保存人信息
+                    if (config.enableRecordSubmit && savedCount > 0) {
                         try {
                             const recordsConfig = await loadRecordsConfig(groupName)
                             
@@ -647,6 +886,8 @@ export function apply(ctx: Context, config: Config) {
                             loginfo('记录被保存人信息失败:', err)
                             // 不影响存图成功
                         }
+                    } else if (!config.enableRecordSubmit && savedCount > 0) {
+                        loginfo(`记录功能已禁用，不记录本次保存操作`)
                     }
                     
                     return formatMessage(`保存成功了喵~，现在有 ${mediaCount} 张图片呢~`, `保存成功，现在有 ${mediaCount} 张图片。`)
@@ -701,13 +942,36 @@ export function apply(ctx: Context, config: Config) {
                 )
             }
 
-            // 检查是否与其他关键词冲突
+            // 检查是否与JSON配置中的其他关键词冲突
             for (const item of aliasConfig) {
                 if (item.keyword === sanitizedAlias || item.aliases.includes(sanitizedAlias)) {
                     return formatMessage(
-                        `别名 "${alias}" 与现有关键词冲突喵！`,
-                        `别名 "${alias}" 与现有关键词冲突，无法添加。`
+                        `别名 "${alias}" 与现有关键词或别名冲突喵！`,
+                        `别名 "${alias}" 与现有关键词或别名冲突，无法添加。`
                     )
+                }
+            }
+
+            // 检查整个文件夹系统中是否已存在该别名
+            // 这确保了即使 JSON 配置不完整，也能检测到别名冲突
+            try {
+                const imagePath = getImagePath(groupName)
+                const folder = await fs.readdir(imagePath, { withFileTypes: true })
+                const folders = folder.filter(f => f.isDirectory()).map(f => f.name)
+                
+                for (const folderName of folders) {
+                    // 解析文件夹名中包含的所有别名部分
+                    const parts = folderName.split('-')
+                    if (parts.includes(sanitizedAlias)) {
+                        return formatMessage(
+                            `别名 "${alias}" 在实际文件夹中已存在喵！`,
+                            `别名 "${alias}" 在实际文件夹中已存在，无法添加。`
+                        )
+                    }
+                }
+            } catch (err: any) {
+                if (config.debugMode) {
+                    loginfo(`检查文件夹系统时出错: ${err.message}`)
                 }
             }
 
@@ -769,6 +1033,33 @@ export function apply(ctx: Context, config: Config) {
                             `别名「${newAlias}」与现有关键词或别名冲突喵！`,
                             `别名「${newAlias}」与现有关键词或别名冲突。`
                         )
+                    }
+                }
+
+                // 扫描文件夹系统中的所有部分，确保没有冲突
+                // 包括处理旧的格式文件夹名 (keyword-alias1-alias2)
+                const allParts = [mainPart, ...aliasParts]
+                try {
+                    const imagePath = getImagePath(groupName)
+                    const folder = await fs.readdir(imagePath, { withFileTypes: true })
+                    const folders = folder.filter(f => f.isDirectory()).map(f => f.name)
+                    
+                    for (const folderName of folders) {
+                        // 解析文件夹名中的所有部分
+                        const folderParts = folderName.split('-')
+                        
+                        for (const part of allParts) {
+                            if (folderParts.includes(part)) {
+                                return formatMessage(
+                                    `「${part}」在实际文件夹系统中已存在喵！无法创建。`,
+                                    `「${part}」在实际文件夹系统中已存在，无法创建。`
+                                )
+                            }
+                        }
+                    }
+                } catch (err: any) {
+                    if (config.debugMode) {
+                        loginfo(`检查文件夹系统时出错: ${err.message}`)
                     }
                 }
 
@@ -1028,6 +1319,9 @@ export function apply(ctx: Context, config: Config) {
             const userId = session.userId
 
             try {
+                // 首次调用时进行数据迁移
+                await migrateOldRecords(groupName)
+
                 // 获取被引用消息的内容，提取图片信息
                 const quoteContent = session.quote.content
                 const elements = h.parse(quoteContent)
@@ -1044,43 +1338,57 @@ export function apply(ctx: Context, config: Config) {
                 // 加载记录配置
                 const recordsConfig = await loadRecordsConfig(groupName)
                 
-                // 查找该用户创建的记录
+                // 查找该用户创建或可以删除的记录
                 let deletedCount = 0
                 for (let i = recordsConfig.length - 1; i >= 0; i--) {
                     const record = recordsConfig[i]
-                    // 检查删除申请人是否是被保存人
-                    if (record.recordedUserId === userId) {
-                        // 删除与被引用消息相关的文件
-                        // 由于我们无法精确匹配被引用的具体文件，这里删除该记录下所有最新的文件
-                        const folderPath = join(getImagePath(groupName), record.keyword)
-                        
-                        for (let j = record.files.length - 1; j >= 0; j--) {
-                            const file = record.files[j]
-                            const filePath = join(folderPath, file.filename)
-                            
-                            try {
-                                // 删除文件
-                                await fs.unlink(filePath)
-                                // 从配置中删除记录
-                                record.files.splice(j, 1)
-                                deletedCount++
-                                loginfo(`已删除文件: ${file.filename} for user ${userId}`)
-                                
-                                // 如果该记录下没有文件了，删除整个记录
-                                if (record.files.length === 0) {
-                                    recordsConfig.splice(i, 1)
-                                }
-                                
-                                // 只删除一个最新的
-                                break
-                            } catch (err) {
-                                loginfo(`删除文件失败: ${file.filename}`, err)
-                            }
-                        }
+                    
+                    // 检查是否可以删除此记录
+                    let canDelete = false
+                    
+                    if (record.recordedUserId === 'unknown') {
+                        // 旧格式的迁移数据，只允许管理员或拥有权限的用户删除
+                        // 这里允许任何人删除，但可以添加权限验证
+                        canDelete = true
+                    } else if (record.recordedUserId === userId) {
+                        // 新格式的数据，只允许原上传者删除
+                        canDelete = true
+                    }
+                    
+                    if (!canDelete) continue
 
-                        if (deletedCount > 0) {
+                    // 尝试删除该记录下的最新文件
+                    const folderPath = join(getImagePath(groupName), record.keyword)
+                    
+                    for (let j = record.files.length - 1; j >= 0; j--) {
+                        const file = record.files[j]
+                        const filePath = join(folderPath, file.filename)
+                        
+                        try {
+                            // 删除文件
+                            await fs.unlink(filePath)
+                            // 从配置中删除记录
+                            record.files.splice(j, 1)
+                            deletedCount++
+                            
+                            // 标记删除原因
+                            const sourceInfo = record.recordedUserId === 'unknown' ? ' (旧版数据)' : ''
+                            loginfo(`已删除文件: ${file.filename} for user ${userId}${sourceInfo}`)
+                            
+                            // 如果该记录下没有文件了，删除整个记录
+                            if (record.files.length === 0) {
+                                recordsConfig.splice(i, 1)
+                            }
+                            
+                            // 只删除一个最新的
                             break
+                        } catch (err) {
+                            loginfo(`删除文件失败: ${file.filename}`, err)
                         }
+                    }
+
+                    if (deletedCount > 0) {
+                        break
                     }
                 }
 
@@ -1164,4 +1472,26 @@ export function apply(ctx: Context, config: Config) {
 
         return null
     }
+
+    // ========== 插件启动时的初始化 ==========
+    // 在插件启动时自动发现所有群组并执行数据迁移
+    ctx.on('ready', async () => {
+        loginfo('\n========== 开始插件初始化 ==========')
+        
+        // 1. 生成群组发现报告
+        await generateGroupDiscoveryReport()
+        
+        // 2. 自动迁移所有发现的群组
+        if (config.enableRecordSubmit || config.enableRecordDelete) {
+            await autoMigrateAllGroups()
+        }
+        
+        // 3. 如果启用了调试模式，生成建议的群组映射配置
+        if (config.debugMode) {
+            const mappingConfig = await generateGroupMappingConfig()
+            loginfo('建议的群组映射配置（调试用）：\n' + mappingConfig)
+        }
+        
+        loginfo('========== 插件初始化完成 ==========\n')
+    })
 }
