@@ -537,6 +537,7 @@ export function apply(ctx: Context, config: Config) {
                     filename = filename.replace(/[\u0000-\u001f\u007f-\u009f\/\\:*?"<>|]/g, '_')
 
                     const filepath = join(targetPath, filename)
+                    
 
                     await fs.writeFile(filepath, buffer)
                     savedCount++
@@ -545,7 +546,8 @@ export function apply(ctx: Context, config: Config) {
                 }
 
                 if (matched) {
-                    return formatMessage('保存成功了喵~', '保存成功！')
+                    const mediaCount = await countMediaFilesInFolder(targetPath)
+                    return formatMessage(`保存成功了喵~，现在有 ${mediaCount} 张图片呢~`, `保存成功，现在有 ${mediaCount} 张图片。`)
                 } else {
                     return formatMessage('保存失败了喵...是不是名字写错了呢~', '保存失败，可能是关键词不存在。')
                 }
