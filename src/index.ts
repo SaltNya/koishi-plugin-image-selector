@@ -1398,13 +1398,13 @@ export function apply(ctx: Context, config: Config) {
                         `已删除您的 ${deletedCount} 条图片记录喵~`,
                         `已删除您的 ${deletedCount} 条图片记录。`
                     ))
-                    return false
+                    return 
                 } else {
                     await session.send(formatMessage(
                         `没有找到属于您的图片记录呢...`,
                         `没有找到属于您的图片记录。`
                     ))
-                    return false
+                    return 
                 }
             } catch (error) {
                 loginfo('删除记录失败:', error)
@@ -1412,7 +1412,7 @@ export function apply(ctx: Context, config: Config) {
                     `删除失败了喵...${error.message}`,
                     `删除失败: ${error.message}`
                 ))
-                return false
+                return 
             }
         }
 
