@@ -318,6 +318,10 @@ export function apply(ctx: Context, config: Config) {
         return join(basePath, groupName, 'temp')
     }
 
+    function getDeletePath(groupName: string): string {
+        return join(basePath, groupName, 'delete')
+    }
+
     function getAliasConfigPath(groupName: string): string {
         return join(basePath, groupName, 'alias-config.json')
     }
@@ -342,6 +346,81 @@ export function apply(ctx: Context, config: Config) {
     interface AliasConfig {
         keyword: string
         aliases: string[]
+    }
+
+    interface SentMediaRecord {
+        groupName: string
+        keyword: string
+        filename: string
+        sentAt: number
+    }
+
+    interface PendingDeleteRecord {
+        code: string
+        groupName: string
+        userId: string
+        sentMediaRecord: SentMediaRecord
+        expiresAt: number
+    }
+
+    const sentMediaRecordMap = new Map<string, SentMediaRecord>()
+    const SENT_MEDIA_RECORD_TTL = 24 * 60 * 60 * 1000
+    const pendingDeleteMap = new Map<string, PendingDeleteRecord>()
+    const PENDING_DELETE_TTL = 60 * 1000
+
+    function normalizeMessageId(messageId: string): string {
+        return String(messageId).trim()
+    }
+
+    function saveSentMediaRecord(messageId: string, record: SentMediaRecord, platform?: string): void {
+        const normalizedId = normalizeMessageId(messageId)
+        if (!normalizedId) return
+
+        sentMediaRecordMap.set(normalizedId, record)
+        if (platform && !normalizedId.startsWith(`${platform}:`)) {
+            sentMediaRecordMap.set(`${platform}:${normalizedId}`, record)
+        }
+    }
+
+    function getSentMediaRecord(messageId: string, platform?: string): SentMediaRecord | null {
+        const normalizedId = normalizeMessageId(messageId)
+        if (!normalizedId) return null
+
+        const directHit = sentMediaRecordMap.get(normalizedId)
+        if (directHit) return directHit
+
+        if (platform) {
+            const prefixedHit = sentMediaRecordMap.get(`${platform}:${normalizedId}`)
+            if (prefixedHit) return prefixedHit
+        }
+
+        return null
+    }
+
+    function cleanupSentMediaRecordMap(): void {
+        const now = Date.now()
+        for (const [messageId, record] of sentMediaRecordMap.entries()) {
+            if (now - record.sentAt > SENT_MEDIA_RECORD_TTL) {
+                sentMediaRecordMap.delete(messageId)
+            }
+        }
+    }
+
+    function getDeleteSessionKey(session: Session): string {
+        return `${session.platform}:${session.channelId || 'private'}:${session.userId}`
+    }
+
+    function createDeleteVerifyCode(): string {
+        return Math.floor(100000 + Math.random() * 900000).toString()
+    }
+
+    function cleanupPendingDeleteMap(): void {
+        const now = Date.now()
+        for (const [key, record] of pendingDeleteMap.entries()) {
+            if (record.expiresAt <= now) {
+                pendingDeleteMap.delete(key)
+            }
+        }
     }
 
     // 加载别名配置
@@ -428,6 +507,57 @@ export function apply(ctx: Context, config: Config) {
             loginfo(`开始迁移旧数据 for group ${groupName}`)
             const imagePath = getImagePath(groupName)
             const recordsConfig: RecordConfig[] = []
+
+            // 先将旧版目录名（keyword-alias1-alias2）重命名为新版目录名（keyword）
+            // 若 keyword 目录已存在，则将旧目录文件迁移进去，避免数据丢失
+            try {
+                const folderEntries = await fs.readdir(imagePath, { withFileTypes: true })
+                const folderNames = folderEntries.filter(item => item.isDirectory()).map(item => item.name)
+
+                for (const oldFolderName of folderNames) {
+                    if (!oldFolderName.includes('-')) continue
+
+                    const parts = oldFolderName.split('-').filter(Boolean)
+                    const keyword = parts[0]
+                    if (!keyword || keyword === oldFolderName) continue
+
+                    const oldPath = join(imagePath, oldFolderName)
+                    const newPath = join(imagePath, keyword)
+
+                    try {
+                        await fs.access(newPath)
+                        // 目标目录已存在：逐个迁移文件并处理同名冲突
+                        const oldFiles = await fs.readdir(oldPath)
+                        for (const fileName of oldFiles) {
+                            const sourceFilePath = join(oldPath, fileName)
+                            let targetFileName = fileName
+                            let targetFilePath = join(newPath, targetFileName)
+
+                            try {
+                                await fs.access(targetFilePath)
+                                const dotIndex = targetFileName.lastIndexOf('.')
+                                const hasExt = dotIndex > 0
+                                const baseName = hasExt ? targetFileName.slice(0, dotIndex) : targetFileName
+                                const ext = hasExt ? targetFileName.slice(dotIndex) : ''
+                                targetFileName = `${baseName}-migrated-${Date.now()}${ext}`
+                                targetFilePath = join(newPath, targetFileName)
+                            } catch {
+                                // 不重名，保持原文件名
+                            }
+
+                            await fs.rename(sourceFilePath, targetFilePath)
+                        }
+                        await fs.rmdir(oldPath)
+                        loginfo(`旧目录合并完成: ${oldFolderName} -> ${keyword}`)
+                    } catch {
+                        // 目标目录不存在：直接改名
+                        await fs.rename(oldPath, newPath)
+                        loginfo(`旧目录重命名完成: ${oldFolderName} -> ${keyword}`)
+                    }
+                }
+            } catch (err: any) {
+                loginfo(`旧目录重命名失败，将继续迁移: ${err.message}`)
+            }
 
             // 首先检查 alias-config.json 是否存在
             let aliasConfig: AliasConfig[] = []
@@ -1279,7 +1409,18 @@ export function apply(ctx: Context, config: Config) {
                     ? h.video(filePath)
                     : h.image(filePath)
 
-                await session.send(element)
+                const sendResult = await session.send(element)
+                const sentIds = Array.isArray(sendResult) ? sendResult : [sendResult]
+                cleanupSentMediaRecordMap()
+                for (const sentId of sentIds) {
+                    if (!sentId) continue
+                    saveSentMediaRecord(String(sentId), {
+                        groupName,
+                        keyword,
+                        filename: randomFile,
+                        sentAt: Date.now(),
+                    }, session.platform)
+                }
             }
 
             return true
@@ -1301,17 +1442,143 @@ export function apply(ctx: Context, config: Config) {
             await processImageRequest(session, keyword, groupName, true)
         })
 
+    async function executeDeleteByRecord(session: Session, groupName: string, userId: string, sentMediaRecord: SentMediaRecord): Promise<boolean> {
+        const filePath = join(getImagePath(groupName), sentMediaRecord.keyword, sentMediaRecord.filename)
+
+        try {
+            await fs.access(filePath)
+        } catch {
+            await session.send(formatMessage('该图片无法删除喵...', '该图片无法删除'))
+            return true
+        }
+
+        const recordsConfig = await loadRecordsConfig(groupName)
+        const targetRecordIndex = recordsConfig.findIndex(record =>
+            record.keyword === sentMediaRecord.keyword &&
+            record.files.some(file => file.filename === sentMediaRecord.filename)
+        )
+        const fallbackRecordIndex = targetRecordIndex !== -1
+            ? targetRecordIndex
+            : recordsConfig.findIndex(record => record.files.some(file => file.filename === sentMediaRecord.filename))
+
+        let targetRecord: RecordConfig | null = null
+        let fileIndex = -1
+        if (fallbackRecordIndex !== -1) {
+            targetRecord = recordsConfig[fallbackRecordIndex]
+            fileIndex = targetRecord.files.findIndex(file => file.filename === sentMediaRecord.filename)
+        }
+
+        if (targetRecord) {
+            let canDelete = false
+            if (targetRecord.recordedUserId === 'unknown') {
+                canDelete = true
+            } else if (targetRecord.recordedUserId === userId) {
+                canDelete = true
+            }
+
+            if (!canDelete) {
+                await session.send(formatMessage(
+                    `该图片无法删除喵...`,
+                    `该图片无法删除`
+                ))
+                return true
+            }
+        }
+
+        try {
+            const recycleDir = join(getDeletePath(groupName), sentMediaRecord.keyword)
+            await fs.mkdir(recycleDir, { recursive: true })
+
+            let targetFilename = sentMediaRecord.filename
+            let targetPath = join(recycleDir, targetFilename)
+            try {
+                await fs.access(targetPath)
+                const dotIndex = targetFilename.lastIndexOf('.')
+                const hasExt = dotIndex > 0
+                const name = hasExt ? targetFilename.slice(0, dotIndex) : targetFilename
+                const ext = hasExt ? targetFilename.slice(dotIndex) : ''
+                targetFilename = `${name}-${Date.now()}${ext}`
+                targetPath = join(recycleDir, targetFilename)
+            } catch {
+                // 目标文件不存在，直接使用原文件名
+            }
+
+            await fs.rename(filePath, targetPath)
+            if (targetRecord && fileIndex !== -1) {
+                targetRecord.files.splice(fileIndex, 1)
+                if (targetRecord.files.length === 0 && fallbackRecordIndex !== -1) {
+                    recordsConfig.splice(fallbackRecordIndex, 1)
+                }
+                await saveRecordsConfig(groupName, recordsConfig)
+            }
+            await session.send(formatMessage(
+                `已移动到回收目录喵~`,
+                `已移动到回收目录。`
+            ))
+            return true
+        } catch (err) {
+            loginfo(`删除文件失败: ${sentMediaRecord.filename}`, err)
+            await session.send(formatMessage(
+                `该图片无法删除喵...`,
+                `该图片无法删除`
+            ))
+            return true
+        }
+    }
+
     // 删除记录中间件
     ctx.middleware(async (session, next) => {
         // 检查是否启用了删除功能
         if (!config.enableRecordDelete) return next()
 
         const input = session.stripped.content.trim()
+        cleanupPendingDeleteMap()
+
+        const deleteSessionKey = getDeleteSessionKey(session)
+        const pendingDelete = pendingDeleteMap.get(deleteSessionKey)
+        if (pendingDelete && input === pendingDelete.code) {
+            pendingDeleteMap.delete(deleteSessionKey)
+            try {
+                await migrateOldRecords(pendingDelete.groupName)
+                await executeDeleteByRecord(session, pendingDelete.groupName, pendingDelete.userId, pendingDelete.sentMediaRecord)
+                return
+            } catch (error) {
+                loginfo('确认删除执行失败:', error)
+                await session.send(formatMessage(
+                    `删除失败了喵...${error.message}`,
+                    `删除失败: ${error.message}`
+                ))
+                return
+            }
+        }
         
         // 检查是否是删除指令
         if (input === '删除' || input === 'delete' || input === '删') {
             // 检查是否有被引用的消息
             if (!session.quote) {
+                return next()
+            }
+
+            // 额外检测：仅当被引用消息由当前 bot 账号发出时才触发删除逻辑
+            const botSelfId = session.bot?.selfId ? String(session.bot.selfId) : ''
+            const quoteData = session.quote as any
+            const quoteSenderCandidates = [
+                quoteData?.user?.id,
+                quoteData?.author?.id,
+                quoteData?.uid,
+                quoteData?.userId,
+                quoteData?.sid,
+            ]
+                .filter(Boolean)
+                .map((id: any) => String(id).trim())
+
+            const isQuotedFromBot = botSelfId
+                ? quoteSenderCandidates.some((senderId: string) =>
+                    senderId === botSelfId || senderId === `${session.platform}:${botSelfId}`
+                )
+                : false
+
+            if (!isQuotedFromBot) {
                 return next()
             }
 
@@ -1334,78 +1601,26 @@ export function apply(ctx: Context, config: Config) {
                 // 尝试从被引用消息中获取文件路径信息
                 // 这里需要从 session.quote 中获取原始的图片文件信息
                 const quoteId = session.quote.id || session.quote.messageId || ''
-                
-                // 加载记录配置
-                const recordsConfig = await loadRecordsConfig(groupName)
-                
-                // 查找该用户创建或可以删除的记录
-                let deletedCount = 0
-                for (let i = recordsConfig.length - 1; i >= 0; i--) {
-                    const record = recordsConfig[i]
-                    
-                    // 检查是否可以删除此记录
-                    let canDelete = false
-                    
-                    if (record.recordedUserId === 'unknown') {
-                        // 旧格式的迁移数据，只允许管理员或拥有权限的用户删除
-                        // 这里允许任何人删除，但可以添加权限验证
-                        canDelete = true
-                    } else if (record.recordedUserId === userId) {
-                        // 新格式的数据，只允许原上传者删除
-                        canDelete = true
-                    }
-                    
-                    if (!canDelete) continue
-
-                    // 尝试删除该记录下的最新文件
-                    const folderPath = join(getImagePath(groupName), record.keyword)
-                    
-                    for (let j = record.files.length - 1; j >= 0; j--) {
-                        const file = record.files[j]
-                        const filePath = join(folderPath, file.filename)
-                        
-                        try {
-                            // 删除文件
-                            await fs.unlink(filePath)
-                            // 从配置中删除记录
-                            record.files.splice(j, 1)
-                            deletedCount++
-                            
-                            // 标记删除原因
-                            const sourceInfo = record.recordedUserId === 'unknown' ? ' (旧版数据)' : ''
-                            loginfo(`已删除文件: ${file.filename} for user ${userId}${sourceInfo}`)
-                            
-                            // 如果该记录下没有文件了，删除整个记录
-                            if (record.files.length === 0) {
-                                recordsConfig.splice(i, 1)
-                            }
-                            
-                            // 只删除一个最新的
-                            break
-                        } catch (err) {
-                            loginfo(`删除文件失败: ${file.filename}`, err)
-                        }
-                    }
-
-                    if (deletedCount > 0) {
-                        break
-                    }
+                const sentMediaRecord = quoteId ? getSentMediaRecord(String(quoteId), session.platform) : null
+                if (!sentMediaRecord || sentMediaRecord.groupName !== groupName) {
+                    await session.send(formatMessage('该图片无法删除喵...', '该图片无法删除'))
+                    return
                 }
 
-                if (deletedCount > 0) {
-                    await saveRecordsConfig(groupName, recordsConfig)
-                    await session.send(formatMessage(
-                        `已删除您的 ${deletedCount} 条图片记录喵~`,
-                        `已删除您的 ${deletedCount} 条图片记录。`
-                    ))
-                    return 
-                } else {
-                    await session.send(formatMessage(
-                        `没有找到属于您的图片记录呢...`,
-                        `没有找到属于您的图片记录。`
-                    ))
-                    return 
-                }
+                const code = createDeleteVerifyCode()
+                pendingDeleteMap.set(deleteSessionKey, {
+                    code,
+                    groupName,
+                    userId,
+                    sentMediaRecord,
+                    expiresAt: Date.now() + PENDING_DELETE_TTL,
+                })
+
+                await session.send(formatMessage(
+                    `确认删除呜喵？确认的话输入${code}（60秒内有效喵）`,
+                    `确认删除？确认的话输入${code}（60秒内有效）`
+                ))
+                return
             } catch (error) {
                 loginfo('删除记录失败:', error)
                 await session.send(formatMessage(
