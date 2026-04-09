@@ -155,7 +155,7 @@ default: 0          → 默认所有人禁止上传
 
 ---
 
-### 🏷️ 删除关键词指令 `默认: 删除关键词` · 可自定义（'deleteKeywordCommandName'）
+### ♻︎ 删除关键词指令 `默认: 删除关键词` · 可自定义（'deleteKeywordCommandName'）
 
 将某关键词对应文件夹移动到 `delete/` 目录下，删去原有`alias-config.json`、`records-config.json`信息并暂存
 执行删除前需要回复6位验证码确认
@@ -168,7 +168,7 @@ default: 0          → 默认所有人禁止上传
 
 ---
 
-### 🏷️ 删除别名指令 `默认: 删除别名` · 可自定义（'deleteAliasCommandName'）
+### ♻︎ 删除别名指令 `默认: 删除别名` · 可自定义（'deleteAliasCommandName'）
 为现有的关键词文件夹删除别名。
 
 语法：'删除别名 <关键词/对应别名> <别名>'
