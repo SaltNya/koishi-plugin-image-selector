@@ -19,6 +19,9 @@ export const usage = `
 - **刷新列表**：新增文件夹后手动刷新缓存
 - **添加关键词 [关键词]**：新增一个文件夹
 - **添加别名 [关键词/关键词对应的别名] [要添加的别名]**：在此关键词下添加别名
+- **删除关键词 [关键词/关键词对应的别名]**：删除该关键词及其图片（移入回收目录，需验证码确认）
+- **删除别名 [关键词/关键词对应的别名] [要删除的别名]**：删除此关键词下的一个别名（需验证码确认）
+- **撤销删除关键词 [关键词/关键词对应的别名]**：恢复最近删除的关键词数据
 
 
 <a target="_blank" href="https://www.npmjs.com/package/@deepseaxx/koishi-plugin-image-selector">➤ 详细配置及进阶用法文档</a>
@@ -58,6 +61,9 @@ export interface Config {
 
     // 别名管理功能
     addAliasCommandName: string
+    deleteAliasCommandName: string
+    deleteKeywordCommandName: string
+    undoDeleteKeywordCommandName: string
 
     // 聊天记录删除功能
     enableRecordDelete: boolean
@@ -136,7 +142,10 @@ export const Config: Schema<Config> = Schema.intersect([
 
     // 别名管理功能
     Schema.object({
-        addAliasCommandName: Schema.string().default('添加别名').description('添加别名指令名（可自定义）')
+        addAliasCommandName: Schema.string().default('添加别名').description('添加别名指令名（可自定义）'),
+        deleteAliasCommandName: Schema.string().default('删除别名').description('删除别名指令名（可自定义）'),
+        deleteKeywordCommandName: Schema.string().default('删除关键词').description('删除关键词指令名（可自定义）'),
+        undoDeleteKeywordCommandName: Schema.string().default('撤销删除关键词').description('撤销删除关键词指令名（可自定义）')
     }).description('别名管理功能'),
 
     // 聊天记录删除功能
@@ -363,10 +372,41 @@ export function apply(ctx: Context, config: Config) {
         expiresAt: number
     }
 
+    interface PendingAliasDeleteRecord {
+        code: string
+        groupName: string
+        userId: string
+        keyword: string
+        alias: string
+        expiresAt: number
+    }
+
+    interface PendingKeywordDeleteRecord {
+        code: string
+        groupName: string
+        userId: string
+        keyword: string
+        expiresAt: number
+    }
+
+    interface DeletedKeywordSnapshot {
+        groupName: string
+        keyword: string
+        aliases: string[]
+        aliasItem: AliasConfig
+        deletedRecords: RecordConfig[]
+        movedPath?: string
+        deletedAt: number
+    }
+
     const sentMediaRecordMap = new Map<string, SentMediaRecord>()
     const SENT_MEDIA_RECORD_TTL = 24 * 60 * 60 * 1000
     const pendingDeleteMap = new Map<string, PendingDeleteRecord>()
+    const pendingAliasDeleteMap = new Map<string, PendingAliasDeleteRecord>()
+    const pendingKeywordDeleteMap = new Map<string, PendingKeywordDeleteRecord>()
+    const deletedKeywordSnapshotMap = new Map<string, DeletedKeywordSnapshot>()
     const PENDING_DELETE_TTL = 60 * 1000
+    const DELETED_KEYWORD_SNAPSHOT_TTL = 24 * 60 * 60 * 1000
 
     function normalizeMessageId(messageId: string): string {
         return String(messageId).trim()
@@ -419,6 +459,29 @@ export function apply(ctx: Context, config: Config) {
         for (const [key, record] of pendingDeleteMap.entries()) {
             if (record.expiresAt <= now) {
                 pendingDeleteMap.delete(key)
+            }
+        }
+        for (const [key, record] of pendingAliasDeleteMap.entries()) {
+            if (record.expiresAt <= now) {
+                pendingAliasDeleteMap.delete(key)
+            }
+        }
+        for (const [key, record] of pendingKeywordDeleteMap.entries()) {
+            if (record.expiresAt <= now) {
+                pendingKeywordDeleteMap.delete(key)
+            }
+        }
+    }
+
+    function getDeletedKeywordSnapshotKey(groupName: string, keyword: string): string {
+        return `${groupName}:${keyword}`
+    }
+
+    function cleanupDeletedKeywordSnapshotMap(): void {
+        const now = Date.now()
+        for (const [key, snapshot] of deletedKeywordSnapshotMap.entries()) {
+            if (now - snapshot.deletedAt > DELETED_KEYWORD_SNAPSHOT_TTL) {
+                deletedKeywordSnapshotMap.delete(key)
             }
         }
     }
@@ -1120,6 +1183,195 @@ export function apply(ctx: Context, config: Config) {
             }
         })
 
+    // 删除别名指令（需验证码确认）
+    ctx.command(`${config.deleteAliasCommandName} <keyword> <alias>`)
+        .userFields(['id', 'authority'])
+        .action(async ({ session }, keyword: string, alias: string) => {
+            if (!isGroupEnabled(session)) {
+                return formatMessage(
+                    '该功能未在此群开启，去联系Bot管理员看看吧~',
+                    '该功能未在此群开启，可联系Bot管理员开启。'
+                )
+            }
+            const groupName = getGroupName(session.guildId)
+
+            if (!keyword || !alias) {
+                return formatMessage('请指定关键词和要删除的别名喵...', '请指定关键词和要删除的别名。')
+            }
+
+            const aliasConfig = await loadAliasConfig(groupName)
+            const configItem = aliasConfig.find(item => item.keyword === keyword || item.aliases.includes(keyword))
+            if (!configItem) {
+                return formatMessage(
+                    `未找到关键词 "${keyword}" 对应的配置呢...`,
+                    `未找到关键词 "${keyword}" 对应的配置。`
+                )
+            }
+
+            if (alias === configItem.keyword) {
+                return formatMessage(
+                    `主关键词 "${alias}" 不能作为别名删除喵！`,
+                    `主关键词 "${alias}" 不能作为别名删除。`
+                )
+            }
+
+            if (!configItem.aliases.includes(alias)) {
+                return formatMessage(
+                    `关键词 "${configItem.keyword}" 下不存在别名 "${alias}" 喵...`,
+                    `关键词 "${configItem.keyword}" 下不存在别名 "${alias}"。`
+                )
+            }
+
+            const deleteSessionKey = getDeleteSessionKey(session)
+            const code = createDeleteVerifyCode()
+            pendingAliasDeleteMap.set(deleteSessionKey, {
+                code,
+                groupName,
+                userId: session.userId,
+                keyword: configItem.keyword,
+                alias,
+                expiresAt: Date.now() + PENDING_DELETE_TTL,
+            })
+
+            return formatMessage(
+                `确认删除别名「${alias}」吗喵？确认的话输入${code}（60秒内有效喵）`,
+                `确认删除别名「${alias}」吗？确认的话输入${code}（60秒内有效）`
+            )
+        })
+
+    // 删除关键词指令（需验证码确认）
+    ctx.command(`${config.deleteKeywordCommandName} <keyword>`)
+        .userFields(['id', 'authority'])
+        .action(async ({ session }, keyword: string) => {
+            if (!isGroupEnabled(session)) {
+                return formatMessage(
+                    '该功能未在此群开启，去联系Bot管理员看看吧~',
+                    '该功能未在此群开启，可联系Bot管理员开启。'
+                )
+            }
+            const groupName = getGroupName(session.guildId)
+
+            if (!keyword) {
+                return formatMessage('请指定要删除的关键词喵...', '请指定要删除的关键词。')
+            }
+
+            const aliasConfig = await loadAliasConfig(groupName)
+            const configItem = aliasConfig.find(item => item.keyword === keyword || item.aliases.includes(keyword))
+            if (!configItem) {
+                return formatMessage(
+                    `未找到关键词 "${keyword}" 对应的配置呢...`,
+                    `未找到关键词 "${keyword}" 对应的配置。`
+                )
+            }
+
+            const deleteSessionKey = getDeleteSessionKey(session)
+            const code = createDeleteVerifyCode()
+            pendingKeywordDeleteMap.set(deleteSessionKey, {
+                code,
+                groupName,
+                userId: session.userId,
+                keyword: configItem.keyword,
+                expiresAt: Date.now() + PENDING_DELETE_TTL,
+            })
+
+            return formatMessage(
+                `确认删除关键词「${configItem.keyword}」吗喵？这会把图片移动到回收目录。确认的话输入${code}（60秒内有效喵）`,
+                `确认删除关键词「${configItem.keyword}」吗？这会把图片移动到回收目录。确认的话输入${code}（60秒内有效）`
+            )
+        })
+
+    // 撤销删除关键词指令（按最近一次删除快照恢复）
+    ctx.command(`${config.undoDeleteKeywordCommandName} <keyword>`)
+        .userFields(['id', 'authority'])
+        .action(async ({ session }, keyword: string) => {
+            if (!isGroupEnabled(session)) {
+                return formatMessage(
+                    '该功能未在此群开启，去联系Bot管理员看看吧~',
+                    '该功能未在此群开启，可联系Bot管理员开启。'
+                )
+            }
+            if (!keyword) {
+                return formatMessage('请指定要恢复的关键词喵...', '请指定要恢复的关键词。')
+            }
+
+            const groupName = getGroupName(session.guildId)
+            cleanupDeletedKeywordSnapshotMap()
+
+            const candidates = Array.from(deletedKeywordSnapshotMap.values())
+                .filter(snapshot =>
+                    snapshot.groupName === groupName &&
+                    (snapshot.keyword === keyword || snapshot.aliases.includes(keyword))
+                )
+                .sort((a, b) => b.deletedAt - a.deletedAt)
+
+            const snapshot = candidates[0]
+            if (!snapshot) {
+                return formatMessage(
+                    `未找到可恢复的关键词「${keyword}」喵...`,
+                    `未找到可恢复的关键词「${keyword}」。`
+                )
+            }
+
+            try {
+                const aliasConfig = await loadAliasConfig(groupName)
+                const conflicts = aliasConfig.some(item =>
+                    item.keyword === snapshot.keyword ||
+                    snapshot.aliases.some(alias => item.keyword === alias || item.aliases.includes(alias))
+                )
+                if (conflicts) {
+                    return formatMessage(
+                        `恢复失败喵：当前已存在同名关键词或别名冲突。`,
+                        `恢复失败：当前已存在同名关键词或别名冲突。`
+                    )
+                }
+
+                const targetImagePath = join(getImagePath(groupName), snapshot.keyword)
+                let folderRestored = false
+                if (snapshot.movedPath) {
+                    try {
+                        await fs.access(snapshot.movedPath)
+                        try {
+                            await fs.access(targetImagePath)
+                            return formatMessage(
+                                `恢复失败喵：关键词目录已存在。`,
+                                `恢复失败：关键词目录已存在。`
+                            )
+                        } catch {
+                            // 目标目录不存在，允许恢复
+                        }
+                        await fs.rename(snapshot.movedPath, targetImagePath)
+                        folderRestored = true
+                    } catch (error) {
+                        loginfo(`恢复关键词目录失败: ${snapshot.keyword}`, error)
+                    }
+                }
+
+                aliasConfig.push(snapshot.aliasItem)
+                await saveAliasConfig(groupName, aliasConfig)
+
+                const recordsConfig = await loadRecordsConfig(groupName)
+                recordsConfig.push(...snapshot.deletedRecords)
+                await saveRecordsConfig(groupName, recordsConfig)
+
+                deletedKeywordSnapshotMap.delete(getDeletedKeywordSnapshotKey(groupName, snapshot.keyword))
+                clearCache(groupName)
+
+                return formatMessage(
+                    folderRestored
+                        ? `关键词「${snapshot.keyword}」已恢复成功喵~`
+                        : `关键词配置已恢复喵，但未找到可恢复的图片目录。`,
+                    folderRestored
+                        ? `关键词「${snapshot.keyword}」已恢复成功。`
+                        : `关键词配置已恢复，但未找到可恢复的图片目录。`
+                )
+            } catch (error: any) {
+                return formatMessage(
+                    `恢复失败喵...${error.message}`,
+                    `恢复失败: ${error.message}`
+                )
+            }
+        })
+
     // 创建关键词指令
     ctx.command(`${config.createCommandName} <keyword> [aliases...]`)
         .userFields(['id', 'authority'])
@@ -1526,15 +1778,155 @@ export function apply(ctx: Context, config: Config) {
         }
     }
 
+    async function executeDeleteKeyword(session: Session, groupName: string, keyword: string): Promise<void> {
+        const imageFolderPath = join(getImagePath(groupName), keyword)
+        const recycleRoot = getDeletePath(groupName)
+        const recycleKeywordRoot = join(recycleRoot, keyword)
+        const timestamp = Date.now()
+        const recycleTarget = join(recycleKeywordRoot, `keyword-delete-${timestamp}`)
+
+        await fs.mkdir(recycleKeywordRoot, { recursive: true })
+
+        cleanupDeletedKeywordSnapshotMap()
+
+        const aliasConfig = await loadAliasConfig(groupName)
+        const aliasItem = aliasConfig.find(item => item.keyword === keyword)
+        const recordsConfig = await loadRecordsConfig(groupName)
+        const deletedRecords = recordsConfig.filter(record => record.keyword === keyword)
+
+        let moved = false
+        let movedPath: string | undefined
+        try {
+            await fs.access(imageFolderPath)
+            await fs.rename(imageFolderPath, recycleTarget)
+            moved = true
+            movedPath = recycleTarget
+        } catch (error) {
+            loginfo(`关键词目录移动失败或不存在: ${keyword}`, error)
+        }
+
+        const nextAliasConfig = aliasConfig.filter(item => item.keyword !== keyword)
+        if (nextAliasConfig.length !== aliasConfig.length) {
+            await saveAliasConfig(groupName, nextAliasConfig)
+        }
+
+        const nextRecordsConfig = recordsConfig.filter(record => record.keyword !== keyword)
+        if (nextRecordsConfig.length !== recordsConfig.length) {
+            await saveRecordsConfig(groupName, nextRecordsConfig)
+        }
+
+        if (aliasItem) {
+            deletedKeywordSnapshotMap.set(getDeletedKeywordSnapshotKey(groupName, keyword), {
+                groupName,
+                keyword,
+                aliases: [...aliasItem.aliases],
+                aliasItem: {
+                    keyword: aliasItem.keyword,
+                    aliases: [...aliasItem.aliases],
+                },
+                deletedRecords: deletedRecords.map(record => ({
+                    groupId: record.groupId,
+                    recordedUserId: record.recordedUserId,
+                    recordedUserName: record.recordedUserName,
+                    keyword: record.keyword,
+                    files: record.files.map(file => ({
+                        filename: file.filename,
+                        uploadTime: file.uploadTime,
+                    })),
+                })),
+                movedPath,
+                deletedAt: Date.now(),
+            })
+        }
+
+        for (const [messageId, record] of sentMediaRecordMap.entries()) {
+            if (record.groupName === groupName && record.keyword === keyword) {
+                sentMediaRecordMap.delete(messageId)
+            }
+        }
+
+        clearCache(groupName)
+        await session.send(formatMessage(
+            moved
+                ? `关键词「${keyword}」已删除，文件已移动到回收目录喵~`
+                : `关键词「${keyword}」配置已清理，图片目录未找到喵~`,
+            moved
+                ? `关键词「${keyword}」已删除，文件已移动到回收目录。`
+                : `关键词「${keyword}」配置已清理，图片目录未找到。`
+        ))
+    }
+
     // 删除记录中间件
     ctx.middleware(async (session, next) => {
-        // 检查是否启用了删除功能
-        if (!config.enableRecordDelete) return next()
-
         const input = session.stripped.content.trim()
         cleanupPendingDeleteMap()
 
         const deleteSessionKey = getDeleteSessionKey(session)
+        const pendingKeywordDelete = pendingKeywordDeleteMap.get(deleteSessionKey)
+        if (pendingKeywordDelete && input === pendingKeywordDelete.code) {
+            pendingKeywordDeleteMap.delete(deleteSessionKey)
+            if (pendingKeywordDelete.userId !== session.userId) {
+                await session.send(formatMessage('验证码不匹配喵...', '验证码不匹配。'))
+                return
+            }
+            try {
+                await executeDeleteKeyword(session, pendingKeywordDelete.groupName, pendingKeywordDelete.keyword)
+                return
+            } catch (error: any) {
+                loginfo('确认删除关键词执行失败:', error)
+                await session.send(formatMessage(
+                    `删除关键词失败了喵...${error.message}`,
+                    `删除关键词失败: ${error.message}`
+                ))
+                return
+            }
+        }
+
+        const pendingAliasDelete = pendingAliasDeleteMap.get(deleteSessionKey)
+        if (pendingAliasDelete && input === pendingAliasDelete.code) {
+            pendingAliasDeleteMap.delete(deleteSessionKey)
+            if (pendingAliasDelete.userId !== session.userId) {
+                await session.send(formatMessage('验证码不匹配喵...', '验证码不匹配。'))
+                return
+            }
+            try {
+                const aliasConfig = await loadAliasConfig(pendingAliasDelete.groupName)
+                const configItem = aliasConfig.find(item => item.keyword === pendingAliasDelete.keyword)
+                if (!configItem) {
+                    await session.send(formatMessage('未找到目标关键词，删除失败喵...', '未找到目标关键词，删除失败。'))
+                    return
+                }
+
+                const aliasIndex = configItem.aliases.findIndex(a => a === pendingAliasDelete.alias)
+                if (aliasIndex === -1) {
+                    await session.send(formatMessage(
+                        `别名「${pendingAliasDelete.alias}」已经不存在喵~`,
+                        `别名「${pendingAliasDelete.alias}」已经不存在。`
+                    ))
+                    return
+                }
+
+                configItem.aliases.splice(aliasIndex, 1)
+                await saveAliasConfig(pendingAliasDelete.groupName, aliasConfig)
+                clearCache(pendingAliasDelete.groupName)
+                await session.send(formatMessage(
+                    `别名「${pendingAliasDelete.alias}」删除成功喵！`,
+                    `别名「${pendingAliasDelete.alias}」删除成功。`
+                ))
+                return
+            } catch (error) {
+                loginfo('确认删除别名执行失败:', error)
+                await session.send(formatMessage(
+                    `删除别名失败了喵...${error.message}`,
+                    `删除别名失败: ${error.message}`
+                ))
+                return
+            }
+        }
+
+        // 检查是否启用了删除功能
+        if (!config.enableRecordDelete) return next()
+
         const pendingDelete = pendingDeleteMap.get(deleteSessionKey)
         if (pendingDelete && input === pendingDelete.code) {
             pendingDeleteMap.delete(deleteSessionKey)
