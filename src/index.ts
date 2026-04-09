@@ -1485,7 +1485,7 @@ export function apply(ctx: Context, config: Config) {
                     return formatMessage('图库为空呢...', '图库为空。')
                 }
 
-                const messageLines: string[] = []
+                const listItems: { line: string; mediaCount: number }[] = []
                 let totalMediaCount = 0
 
                 for (const item of aliasConfig) {
@@ -1504,12 +1504,34 @@ export function apply(ctx: Context, config: Config) {
                     } else {
                         line += `有${mediaCount}张图片`
                     }
-                    messageLines.push(line)
+                    listItems.push({ line, mediaCount })
                 }
 
-                const header = `发送指令或别名随机返回图片，也可使用"${config.sendCommandName} 关键词 数量"`
+                // 按图片数量由多到少排序；数量相同时按关键词字典序稳定排序
+                listItems.sort((a, b) => {
+                    if (b.mediaCount !== a.mediaCount) return b.mediaCount - a.mediaCount
+                    return a.line.localeCompare(b.line, 'zh-CN')
+                })
+                const messageLines = listItems.map(item => item.line)
+
+                const header = `使用"${config.sendCommandName} 关键词"随机返回图片`
                 const footer = `总共有 ${totalMediaCount} 张图片喵~`
-                return [header, ...messageLines, footer].join('\n')
+                const listBody = messageLines.join('\n')
+
+                // 头尾单独发送；中间列表合并为一条聊天记录消息。
+                try {
+                    await session.send(header)
+                    const mergedListNode = h('message', {
+                        userId: session.bot?.selfId || session.userId || 'bot',
+                        nickname: session.bot?.selfId ? `Bot-${session.bot.selfId}` : 'Bot',
+                    }, listBody)
+                    await session.send(h('figure', {}, [mergedListNode]))
+                    await session.send(footer)
+                    return
+                } catch (error) {
+                    loginfo('发送聊天记录格式列表失败，回退为纯文本:', error)
+                    return [header, ...messageLines, footer].join('\n')
+                }
 
             } catch (error: any) {
                 return `获取列表失败: ${error.message}`
