@@ -401,6 +401,9 @@ export function apply(ctx: Context, config: Config) {
 
     const sentMediaRecordMap = new Map<string, SentMediaRecord>()
     const SENT_MEDIA_RECORD_TTL = 24 * 60 * 60 * 1000
+    const RECENT_RANDOM_MEDIA_SIZE = 5
+    const RECENT_RANDOM_MEDIA_MIN_FILES = 6
+    const recentRandomMediaMap = new Map<string, string[]>()
     const pendingDeleteMap = new Map<string, PendingDeleteRecord>()
     const pendingAliasDeleteMap = new Map<string, PendingAliasDeleteRecord>()
     const pendingKeywordDeleteMap = new Map<string, PendingKeywordDeleteRecord>()
@@ -410,6 +413,29 @@ export function apply(ctx: Context, config: Config) {
 
     function normalizeMessageId(messageId: string): string {
         return String(messageId).trim()
+    }
+
+    function extractMessageId(value: unknown): string | null {
+        if (value === null || value === undefined) return null
+        if (typeof value === 'string' || typeof value === 'number') {
+            const id = normalizeMessageId(String(value))
+            return id && id !== '[object Object]' ? id : null
+        }
+        if (typeof value === 'object') {
+            const obj = value as { id?: unknown; messageId?: unknown; message_id?: unknown }
+            return extractMessageId(obj.id) || extractMessageId(obj.messageId) || extractMessageId(obj.message_id)
+        }
+        return null
+    }
+
+    function isSameUserId(a: string, b: string): boolean {
+        if (a === b) return true
+        const normalize = (id: string) => {
+            const trimmed = String(id || '').trim()
+            const colonIndex = trimmed.indexOf(':')
+            return colonIndex > 0 ? trimmed.slice(colonIndex + 1) : trimmed
+        }
+        return normalize(a) === normalize(b)
     }
 
     function saveSentMediaRecord(messageId: string, record: SentMediaRecord, platform?: string): void {
@@ -426,15 +452,100 @@ export function apply(ctx: Context, config: Config) {
         const normalizedId = normalizeMessageId(messageId)
         if (!normalizedId) return null
 
-        const directHit = sentMediaRecordMap.get(normalizedId)
-        if (directHit) return directHit
-
+        const lookupKeys = new Set<string>([normalizedId])
         if (platform) {
-            const prefixedHit = sentMediaRecordMap.get(`${platform}:${normalizedId}`)
-            if (prefixedHit) return prefixedHit
+            lookupKeys.add(`${platform}:${normalizedId}`)
+            if (normalizedId.startsWith(`${platform}:`)) {
+                lookupKeys.add(normalizedId.slice(platform.length + 1))
+            }
+        }
+
+        for (const key of lookupKeys) {
+            const hit = sentMediaRecordMap.get(key)
+            if (hit) return hit
         }
 
         return null
+    }
+
+    function resolveSentMediaFromQuotePath(groupName: string, imageElements: h[]): SentMediaRecord | null {
+        const imagesBase = getImagePath(groupName)
+        const normalizedBase = imagesBase.replace(/\\/g, '/').toLowerCase()
+
+        for (const el of imageElements) {
+            const rawSrc = String(el.attrs?.src || el.attrs?.url || '').trim()
+            if (!rawSrc) continue
+
+            let decoded = rawSrc
+            try {
+                decoded = decodeURIComponent(rawSrc)
+            } catch {
+                decoded = rawSrc
+            }
+
+            const pathLike = decoded.replace(/^file:\/*/i, '').replace(/\\/g, '/')
+            const normalizedPath = pathLike.toLowerCase()
+
+            if (normalizedPath.includes(normalizedBase)) {
+                const idx = normalizedPath.indexOf(normalizedBase)
+                const relative = pathLike.slice(idx + normalizedBase.length).replace(/^\/+/, '')
+                const parts = relative.split('/').filter(Boolean)
+                if (parts.length >= 2) {
+                    const filename = parts[parts.length - 1]
+                    const keyword = parts[parts.length - 2]
+                    return { groupName, keyword, filename, sentAt: Date.now() }
+                }
+            }
+
+            const match = pathLike.match(/(?:^|\/)images\/([^/]+)\/([^/]+)$/i)
+            if (match) {
+                const [, keyword, filename] = match
+                return { groupName, keyword, filename, sentAt: Date.now() }
+            }
+        }
+
+        return null
+    }
+
+    function resolveSentMediaRecordForDelete(
+        session: Session,
+        groupName: string,
+        imageElements: h[],
+    ): SentMediaRecord | null {
+        const quote = session.quote
+        if (quote) {
+            const quoteId = extractMessageId(quote.id) || extractMessageId(quote.messageId)
+            if (quoteId) {
+                const fromMap = getSentMediaRecord(quoteId, session.platform)
+                if (fromMap?.groupName === groupName) return fromMap
+            }
+        }
+
+        return resolveSentMediaFromQuotePath(groupName, imageElements)
+    }
+
+    function isQuotedMessageFromBot(session: Session): boolean {
+        const botSelfId = session.bot?.selfId ? String(session.bot.selfId).trim() : ''
+        if (!botSelfId) return false
+
+        const quoteData = session.quote as any
+        const quoteSenderCandidates = [
+            quoteData?.user?.id,
+            quoteData?.user?.uid,
+            quoteData?.author?.id,
+            quoteData?.uid,
+            quoteData?.userId,
+            quoteData?.sid,
+        ]
+            .filter(Boolean)
+            .map((id: any) => String(id).trim())
+
+        return quoteSenderCandidates.some((senderId: string) => {
+            const bareId = senderId.includes(':') ? senderId.split(':').pop()! : senderId
+            return senderId === botSelfId
+                || senderId === `${session.platform}:${botSelfId}`
+                || bareId === botSelfId
+        })
     }
 
     function cleanupSentMediaRecordMap(): void {
@@ -747,11 +858,46 @@ export function apply(ctx: Context, config: Config) {
     function clearCache(groupName?: string) {
         if (groupName) {
             folderCacheMap.delete(groupName)
+            for (const key of recentRandomMediaMap.keys()) {
+                if (key.startsWith(`${groupName}:`)) {
+                    recentRandomMediaMap.delete(key)
+                }
+            }
             loginfo(`文件夹缓存已清除 for group ${groupName}`)
         } else {
             folderCacheMap.clear()
+            recentRandomMediaMap.clear()
             loginfo('所有文件夹缓存已清除')
         }
+    }
+
+    function getRecentRandomMediaKey(groupName: string, keyword: string): string {
+        return `${groupName}:${keyword}`
+    }
+
+    function pickRandomMediaFile(mediaFiles: string[], excludeFiles: string[]): string {
+        if (mediaFiles.length === 0) {
+            throw new Error('mediaFiles must not be empty')
+        }
+
+        if (mediaFiles.length < RECENT_RANDOM_MEDIA_MIN_FILES || excludeFiles.length === 0) {
+            return mediaFiles[Math.floor(Math.random() * mediaFiles.length)]
+        }
+
+        const excludeSet = new Set(excludeFiles)
+        const candidates = mediaFiles.filter(file => !excludeSet.has(file))
+        const pool = candidates.length > 0 ? candidates : mediaFiles
+        return pool[Math.floor(Math.random() * pool.length)]
+    }
+
+    function pushRecentRandomMedia(key: string, filename: string): void {
+        const recent = recentRandomMediaMap.get(key) || []
+        const next = recent.filter(file => file !== filename)
+        next.push(filename)
+        while (next.length > RECENT_RANDOM_MEDIA_SIZE) {
+            next.shift()
+        }
+        recentRandomMediaMap.set(key, next)
     }
 
     const getFileExtension = (file: any, imgType: string): string => {
@@ -1672,8 +1818,16 @@ export function apply(ctx: Context, config: Config) {
                 return true
             }
 
+            const recentRandomKey = getRecentRandomMediaKey(groupName, keyword)
+            const recentRandomFiles = recentRandomMediaMap.get(recentRandomKey) || []
+            const batchPickedFiles: string[] = []
+
             for (let i = 0; i < count; i++) {
-                const randomFile = mediaFiles[Math.floor(Math.random() * mediaFiles.length)]
+                const excludeFiles = mediaFiles.length >= RECENT_RANDOM_MEDIA_MIN_FILES
+                    ? [...recentRandomFiles, ...batchPickedFiles]
+                    : []
+                const randomFile = pickRandomMediaFile(mediaFiles, excludeFiles)
+                batchPickedFiles.push(randomFile)
                 const filePath = join(folderPath, randomFile)
 
                 loginfo(`发送文件 ${i + 1}/${count}:`, randomFile)
@@ -1684,17 +1838,19 @@ export function apply(ctx: Context, config: Config) {
                     : h.image(filePath)
 
                 const sendResult = await session.send(element)
-                const sentIds = Array.isArray(sendResult) ? sendResult : [sendResult]
+                const sentMessages = Array.isArray(sendResult) ? sendResult : [sendResult]
                 cleanupSentMediaRecordMap()
-                for (const sentId of sentIds) {
+                for (const sentMessage of sentMessages) {
+                    const sentId = extractMessageId(sentMessage)
                     if (!sentId) continue
-                    saveSentMediaRecord(String(sentId), {
+                    saveSentMediaRecord(sentId, {
                         groupName,
                         keyword,
                         filename: randomFile,
                         sentAt: Date.now(),
                     }, session.platform)
                 }
+                pushRecentRandomMedia(recentRandomKey, randomFile)
             }
 
             return true
@@ -1746,7 +1902,7 @@ export function apply(ctx: Context, config: Config) {
             let canDelete = false
             if (targetRecord.recordedUserId === 'unknown') {
                 canDelete = true
-            } else if (targetRecord.recordedUserId === userId) {
+            } else if (isSameUserId(targetRecord.recordedUserId, userId)) {
                 canDelete = true
             }
 
@@ -1974,25 +2130,7 @@ export function apply(ctx: Context, config: Config) {
             }
 
             // 额外检测：仅当被引用消息由当前 bot 账号发出时才触发删除逻辑
-            const botSelfId = session.bot?.selfId ? String(session.bot.selfId) : ''
-            const quoteData = session.quote as any
-            const quoteSenderCandidates = [
-                quoteData?.user?.id,
-                quoteData?.author?.id,
-                quoteData?.uid,
-                quoteData?.userId,
-                quoteData?.sid,
-            ]
-                .filter(Boolean)
-                .map((id: any) => String(id).trim())
-
-            const isQuotedFromBot = botSelfId
-                ? quoteSenderCandidates.some((senderId: string) =>
-                    senderId === botSelfId || senderId === `${session.platform}:${botSelfId}`
-                )
-                : false
-
-            if (!isQuotedFromBot) {
+            if (!isQuotedMessageFromBot(session)) {
                 return next()
             }
 
@@ -2012,11 +2150,8 @@ export function apply(ctx: Context, config: Config) {
                     return next()
                 }
 
-                // 尝试从被引用消息中获取文件路径信息
-                // 这里需要从 session.quote 中获取原始的图片文件信息
-                const quoteId = session.quote.id || session.quote.messageId || ''
-                const sentMediaRecord = quoteId ? getSentMediaRecord(String(quoteId), session.platform) : null
-                if (!sentMediaRecord || sentMediaRecord.groupName !== groupName) {
+                const sentMediaRecord = resolveSentMediaRecordForDelete(session, groupName, imageElements)
+                if (!sentMediaRecord) {
                     await session.send(formatMessage('该图片无法删除喵...', '该图片无法删除'))
                     return
                 }
